@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""
+Price Elasticity Analysis Module
+Standalone analysis for multifamily property pricing elasticity
+For Google Colab
+"""
+
+# ============================================================================
+# IMPORTS
+# ============================================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import statsmodels.api as sm
+import warnings
+warnings.filterwarnings('ignore')
+
+# Visualization settings
+plt.style.use('seaborn-v0_8-darkgrid')
+sns.set_palette("husl")
+pd.set_option('display.max_columns', None)
+pd.set_option('display.float_format', lambda x: '%.2f' % x)
+
+# ============================================================================
+# DATA LOADING AND PREPROCESSING
+# ============================================================================
+
+def load_and_preprocess_data(file_path):
+    """
+    Load and preprocess the multifamily property data for elasticity analysis
+    
+    Parameters:
+    -----------
+    file_path : str
+        Path to the CSV file
+    
+    Returns:
+    --------
+    pd.DataFrame : Preprocessed dataframe
+    """
+    
+    # Load data
+    df = pd.read_csv(file_path)
+    
+    # Clean column names
+    df.columns = df.columns.str.strip().str.replace(' - ', '_').str.replace(' ', '_')
+    
+    # Convert date column
+    df['AsOfDate'] = pd.to_datetime(df['AsOfDate'])
+    
+    # Clean numeric columns
+    numeric_cols = ['Average_Market_Rent_Per_Unit', 'Average_Occupied_Rent_Per_Unit',
+                   'Occupied_Percent', 'Total_Units', 'Occupied_Units']
+    
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.replace(',', '').str.replace('"', '')
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    # Calculate occupancy rate
+    if 'Occupied_Percent' in df.columns:
+        df['Occupancy_Rate'] = df['Occupied_Percent'] / 100
+    else:
+        df['Occupancy_Rate'] = df['Occupied_Units'] / df['Total_Units']
+    
+    # Sort by date and unit type
+    df = df.sort_values(['AsOfDate', 'Unit_Type'])
+    
+    return df
+
+# ============================================================================
+# PRICE ELASTICITY CALCULATION
+# ============================================================================
+
+def calculate_price_elasticity(df):
+    """
+    Calculate price elasticity of demand for each unit type
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Property data with rent and occupancy information
+    
+    Returns:
+    --------
+    dict : Elasticity results by unit type
+    pd.DataFrame : Summary statistics dataframe
+    """
+    
+    print("="*60)
+    print("💰 PRICE ELASTICITY OF DEMAND ANALYSIS")
+    print("="*60)
+    print("\nCalculating elasticity for each unit type...")
+    print("-"*40)
+    
+    elasticity_results = {}
+    
+    # Group by unit type for elasticity analysis
+    for unit_type in df['Unit_Type'].unique():
+        unit_data = df[df['Unit_Type'] == unit_type].copy()
+        
+        # Need sufficient data points for reliable regression
+        if len(unit_data) >= 10:
+            # Remove zeros and NaN values
+            valid_data = unit_data[
+                (unit_data['Average_Occupied_Rent_Per_Unit'] > 0) & 
+                (unit_data['Occupancy_Rate'] > 0) &
+                (unit_data['Average_Occupied_Rent_Per_Unit'].notna()) &
+                (unit_data['Occupancy_Rate'].notna())
+            ].copy()
+            
+            if len(valid_data) >= 10:
+                # Log-log regression for elasticity
+                X = np.log(valid_data['Average_Occupied_Rent_Per_Unit'])
+                y = np.log(valid_data['Occupancy_Rate'])
+                
+                # Add constant for regression
+                X_with_const = sm.add_constant(X)
+                
+                try:
+                    # Fit OLS model
+                    model = sm.OLS(y, X_with_const).fit()
+                    
+                    # Extract elasticity (coefficient of log price)
+                    elasticity = model.params[1]
+                    
+                    elasticity_results[unit_type] = {
+                        'elasticity': elasticity,
+                        'r_squared': model.rsquared,
+                        'p_value': model.pvalues[1],
+                        'std_error': model.bse[1],
+                        'observations': len(valid_data),
+                        'avg_rent': valid_data['Average_Occupied_Rent_Per_Unit'].mean(),
+                        'avg_occupancy': valid_data['Occupancy_Rate'].mean()
+                    }
+                    
+                    print(f"✓ {unit_type[:40]}: ε = {elasticity:.3f}")
+                    
+                except Exception as e:
+                    print(f"✗ {unit_type[:40]}: Could not calculate (insufficient variation)")
+    
+    # Create summary dataframe
+    elasticity_df = pd.DataFrame(elasticity_results).T
+    elasticity_df = elasticity_df.sort_values('elasticity')
+    
+    return elasticity_results, elasticity_df
+
+# ============================================================================
+# VISUALIZATION
+# ============================================================================
+
+def create_elasticity_visualizations(elasticity_df, df):
+    """
+    Create comprehensive visualizations for price elasticity analysis
+    """
+    
+    # Create main figure with subplots
+    fig = plt.figure(figsize=(18, 12))
+    
+    # 1. Elasticity by Unit Type (Horizontal Bar Chart)
+    ax1 = plt.subplot(2, 3, 1)
+    
+    # Filter for significant results only
+    significant = elasticity_df[elasticity_df['p_value'] < 0.05].copy()
+    
+    if not significant.empty:
+        colors = ['red' if e < -1 else 'blue' if e > -1 else 'gray' 
+                 for e in significant['elasticity']]
+        
+        bars = ax1.barh(range(len(significant)), significant['elasticity'].values, color=colors)
+        ax1.set_yticks(range(len(significant)))
+        ax1.set_yticklabels([name[:25] for name in significant.index], fontsize=9)
+        ax1.set_xlabel('Price Elasticity Coefficient', fontsize=11)
+        ax1.set_title('Price Elasticity by Unit Type\n(Significant Results Only, p<0.05)', 
+                     fontsize=12, fontweight='bold')
+        ax1.axvline(x=0, color='black', linestyle='-', linewidth=0.5)
+        ax1.axvline(x=-1, color='green', linestyle='--', alpha=0.5, label='Unit Elastic')
+        ax1.grid(True, alpha=0.3, axis='x')
+        ax1.legend(loc='lower right')
+        
+        # Add value labels
+        for i, (idx, row) in enumerate(significant.iterrows()):
+            ax1.text(row['elasticity'], i, f" {row['elasticity']:.2f}", 
+                    va='center', fontsize=8)
+    
+    # 2. Elasticity vs R-squared (Quality of Fit)
+    ax2 = plt.subplot(2, 3, 2)
+    
+    scatter = ax2.scatter(elasticity_df['elasticity'], elasticity_df['r_squared'], 
+                         s=elasticity_df['observations']*3, 
+                         c=elasticity_df['p_value'], 
+                         cmap='RdYlGn_r', alpha=0.6)
+    ax2.set_xlabel('Elasticity Coefficient', fontsize=11)
+    ax2.set_ylabel('R² (Model Fit)', fontsize=11)
+    ax2.set_title('Model Quality vs Elasticity\n(Size = Sample Size)', 
+                 fontsize=12, fontweight='bold')
+    ax2.axvline(x=-1, color='gray', linestyle='--', alpha=0.3)
+    ax2.axvline(x=0, color='black', linestyle='-', linewidth=0.5)
+    ax2.grid(True, alpha=0.3)
+    
+    # Add colorbar for p-value
+    plt.colorbar(scatter, ax=ax2, label='p-value')
+    
+    # 3. Elasticity Interpretation Guide
+    ax3 = plt.subplot(2, 3, 3)
+    ax3.axis('off')
+    
+    interpretation_text = """
+    ELASTICITY INTERPRETATION GUIDE
+    
+    Elastic Demand (|ε| > 1):
+    • Customers are price sensitive
+    • Reducing price increases revenue
+    • Common for luxury units
+    
+    Inelastic Demand (|ε| < 1):
+    • Customers are less price sensitive
+    • Increasing price increases revenue
+    • Common for essential/basic units
+    
+    Unit Elastic (|ε| = 1):
+    • Price changes don't affect revenue
+    • Neutral pricing zone
+    
+    Current Results Summary:
+    """
+    
+    ax3.text(0.05, 0.95, interpretation_text, fontsize=10, 
+            verticalalignment='top', fontfamily='monospace')
+    
+    # Add summary statistics
+    if not elasticity_df.empty:
+        elastic_count = (elasticity_df['elasticity'].abs() > 1).sum()
+        inelastic_count = (elasticity_df['elasticity'].abs() < 1).sum()
+        avg_elasticity = elasticity_df['elasticity'].mean()
+        
+        summary_text = f"""
+    • Elastic units: {elastic_count}
+    • Inelastic units: {inelastic_count}
+    • Average elasticity: {avg_elasticity:.3f}
+    """
+        ax3.text(0.05, 0.35, summary_text, fontsize=10, 
+                fontfamily='monospace', color='blue')
+    
+    # 4. Scatter: Rent vs Occupancy by Unit Type (Top 5)
+    ax4 = plt.subplot(2, 3, 4)
+    
+    # Select top 5 unit types by volume
+    top_units = df.groupby('Unit_Type').size().nlargest(5).index
+    colors_cycle = plt.cm.Set2(np.linspace(0, 1, len(top_units)))
+    
+    for i, unit in enumerate(top_units):
+        unit_data = df[df['Unit_Type'] == unit]
+        ax4.scatter(unit_data['Average_Occupied_Rent_Per_Unit'], 
+                   unit_data['Occupancy_Rate']*100,
+                   label=unit[:20], alpha=0.6, s=30, color=colors_cycle[i])
+    
+    ax4.set_xlabel('Average Rent ($)', fontsize=11)
+    ax4.set_ylabel('Occupancy Rate (%)', fontsize=11)
+    ax4.set_title('Rent vs Occupancy Relationship\n(Top 5 Unit Types)', 
+                 fontsize=12, fontweight='bold')
+    ax4.legend(loc='best', fontsize=8)
+    ax4.grid(True, alpha=0.3)
+    
+    # 5. Distribution of Elasticity Values
+    ax5 = plt.subplot(2, 3, 5)
+    
+    if not elasticity_df.empty:
+        ax5.hist(elasticity_df['elasticity'], bins=15, edgecolor='black', alpha=0.7)
+        ax5.axvline(x=-1, color='green', linestyle='--', label='Unit Elastic', linewidth=2)
+        ax5.axvline(x=0, color='red', linestyle='-', label='Zero Elasticity', linewidth=2)
+        ax5.axvline(x=elasticity_df['elasticity'].mean(), color='blue', 
+                   linestyle=':', label=f'Mean ({elasticity_df["elasticity"].mean():.2f})', 
+                   linewidth=2)
+        ax5.set_xlabel('Elasticity Value', fontsize=11)
+        ax5.set_ylabel('Frequency', fontsize=11)
+        ax5.set_title('Distribution of Price Elasticities', 
+                     fontsize=12, fontweight='bold')
+        ax5.legend()
+        ax5.grid(True, alpha=0.3, axis='y')
+    
+    # 6. Recommendations Table
+    ax6 = plt.subplot(2, 3, 6)
+    ax6.axis('off')
+    
+    # Create recommendations based on elasticity
+    recommendations = []
+    for unit, data in elasticity_df.iterrows():
+        if data['p_value'] < 0.05:  # Only significant results
+            if data['elasticity'] < -1:
+                action = "↓ Reduce price 3-5%"
+                impact = "Increase occupancy"
+            elif data['elasticity'] > -1 and data['elasticity'] < 0:
+                action = "↑ Increase price 2-3%"
+                impact = "Increase revenue"
+            else:
+                action = "→ Maintain price"
+                impact = "Monitor market"
+            
+            recommendations.append([
+                unit[:20],
+                f"{data['elasticity']:.2f}",
+                action,
+                impact
+            ])
+    
+    if recommendations:
+        # Limit to top 10 recommendations
+        recommendations = recommendations[:10]
+        
+        table = ax6.table(cellText=recommendations,
+                         colLabels=['Unit Type', 'Elasticity', 'Action', 'Impact'],
+                         cellLoc='left',
+                         loc='center',
+                         colWidths=[0.35, 0.15, 0.25, 0.25])
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1, 1.5)
+        
+        # Style the header
+        for i in range(4):
+            table[(0, i)].set_facecolor('#4CAF50')
+            table[(0, i)].set_text_props(weight='bold', color='white')
+        
+        # Color code the rows
+        for i in range(1, len(recommendations) + 1):
+            elasticity_val = float(recommendations[i-1][1])
+            if elasticity_val < -1:
+                color = '#ffcccc'  # Light red for elastic
+            elif elasticity_val > -1:
+                color = '#ccffcc'  # Light green for inelastic
+            else:
+                color = '#f0f0f0'  # Gray for neutral
+            
+            for j in range(4):
+                table[(i, j)].set_facecolor(color)
+    
+    ax6.set_title('Pricing Recommendations', fontsize=12, fontweight='bold', y=0.95)
+    
+    plt.suptitle('PRICE ELASTICITY ANALYSIS DASHBOARD', 
+                fontsize=16, fontweight='bold', y=0.98)
+    plt.tight_layout()
+    plt.show()
+    
+    return fig
+
+
+
+# ============================================================================
+# SECTION 5: PRICING ELASTICITY ANALYSIS
+# ============================================================================
+
+def calculate_price_elasticity(df):
+    """
+    Calculate price elasticity of demand for occupancy
+    """
+
+    print("\n" + "="*60)
+    print("💰 PRICE ELASTICITY ANALYSIS")
+    print("="*60)
+
+    # Group by unit type for elasticity analysis
+    elasticity_results = {}
+
+    for unit_type in df['Unit_Type'].unique():
+        unit_data = df[df['Unit_Type'] == unit_type].copy()
+
+        if len(unit_data) > 10:  # Need sufficient data points
+            # Log-log regression for elasticity
+            X = np.log(unit_data['Average_Occupied_Rent_Per_Unit'].replace(0, np.nan).dropna())
+            y = np.log(unit_data['Occupancy_Rate'].replace(0, np.nan).dropna())
+
+            if len(X) > 10:
+                # Align X and y
+                valid_idx = X.index.intersection(y.index)
+                X = X.loc[valid_idx]
+                y = y.loc[valid_idx]
+
+                # Add constant for regression
+                X_with_const = sm.add_constant(X)
+                model = sm.OLS(y, X_with_const).fit()
+
+                elasticity = model.params[1]
+                elasticity_results[unit_type] = {
+                    'elasticity': elasticity,
+                    'r_squared': model.rsquared,
+                    'p_value': model.pvalues[1]
+                }
+
+    # Display results
+    elasticity_df = pd.DataFrame(elasticity_results).T
+    elasticity_df = elasticity_df.sort_values('elasticity')
+
+    # Visualization
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+
+    # Elasticity by unit type
+    axes[0].barh(range(len(elasticity_df)), elasticity_df['elasticity'].values)
+    axes[0].set_yticks(range(len(elasticity_df)))
+    axes[0].set_yticklabels(elasticity_df.index, fontsize=8)
+    axes[0].set_xlabel('Price Elasticity')
+    axes[0].set_title('Price Elasticity by Unit Type')
+    axes[0].axvline(x=0, color='red', linestyle='--', alpha=0.5)
+    axes[0].axvline(x=-1, color='blue', linestyle='--', alpha=0.5)
+    axes[0].grid(True, alpha=0.3)
+
+    # Elasticity interpretation
+    axes[1].text(0.1, 0.9, 'Elasticity Interpretation:', fontsize=14, fontweight='bold')
+    axes[1].text(0.1, 0.8, '• |ε| > 1: Elastic demand (price sensitive)', fontsize=11)
+    axes[1].text(0.1, 0.7, '• |ε| = 1: Unit elastic', fontsize=11)
+    axes[1].text(0.1, 0.6, '• |ε| < 1: Inelastic demand (price insensitive)', fontsize=11)
+    axes[1].text(0.1, 0.4, 'Optimal Pricing Strategy:', fontsize=14, fontweight='bold')
+    axes[1].text(0.1, 0.3, '• Elastic: Lower prices to increase occupancy', fontsize=11)
+    axes[1].text(0.1, 0.2, '• Inelastic: Increase prices to maximize revenue', fontsize=11)
+    axes[1].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+    # Print summary
+    print("\nElasticity Summary:")
+    print(elasticity_df.to_string())
+
+    # Calculate optimal price adjustments
+    print("\n" + "="*60)
+    print("📐 OPTIMAL PRICE ADJUSTMENTS")
+    print("="*60)
+
+    for unit_type, metrics in elasticity_results.items():
+        if metrics['p_value'] < 0.05:  # Only for significant results
+            elasticity = metrics['elasticity']
+            current_rent = df[df['Unit_Type'] == unit_type]['Average_Occupied_Rent_Per_Unit'].mean()
+
+            # Optimal pricing formula based on elasticity
+            if abs(elasticity) != 0:
+                optimal_adjustment = 1 / (1 + abs(elasticity))
+
+                if elasticity < -1:  # Elastic
+                    recommendation = "Consider reducing price"
+                    adjustment = -optimal_adjustment * 0.05  # 5% max adjustment
+                elif elasticity > -1 and elasticity < 0:  # Inelastic
+                    recommendation = "Consider increasing price"
+                    adjustment = optimal_adjustment * 0.05
+                else:
+                    recommendation = "Maintain current pricing"
+                    adjustment = 0
+
+                optimal_rent = current_rent * (1 + adjustment)
+
+                print(f"\n{unit_type[:30]}:")
+                print(f"  Current Rent: ${current_rent:.2f}")
+                print(f"  Elasticity: {elasticity:.3f}")
+                print(f"  Recommendation: {recommendation}")
+                print(f"  Suggested Rent: ${optimal_rent:.2f}")
+                print(f"  Potential Impact: {adjustment*100:.1f}%")
+
+    return elasticity_results
+
+# Calculate price elasticity
+elasticity_results = calculate_price_elasticity(df)
+
+
+# ============================================================================
+# SUMMARY STATISTICS
+# ============================================================================
+
+def print_elasticity_summary(elasticity_df):
+    """
+    Print detailed summary statistics for elasticity analysis
+    """
+    
+    print("\n" + "="*60)
+    print("📊 ELASTICITY ANALYSIS SUMMARY")
+    print("="*60)
+    
+    if elasticity_df.empty:
+        print("No elasticity calculations available.")
+        return
+    
+    # Overall statistics
+    print("\n1. OVERALL STATISTICS")
+    print("-"*40)
+    print(f"Total unit types analyzed: {len(elasticity_df)}")
+    print(f"Average elasticity: {elasticity_df['elasticity'].mean():.3f}")
+    print(f"Median elasticity: {elasticity_df['elasticity'].median():.3f}")
+    print(f"Standard deviation: {elasticity_df['elasticity'].std():.3f}")
+    
+    # Categorization
+    print("\n2. DEMAND CATEGORIZATION")
+    print("-"*40)
+    elastic = elasticity_df[elasticity_df['elasticity'].abs() > 1]
+    inelastic = elasticity_df[elasticity_df['elasticity'].abs() < 1]
+    unit_elastic = elasticity_df[elasticity_df['elasticity'].abs() == 1]
+    
+    print(f"Elastic demand (|ε| > 1): {len(elastic)} units ({len(elastic)/len(elasticity_df)*100:.1f}%)")
+    print(f"Inelastic demand (|ε| < 1): {len(inelastic)} units ({len(inelastic)/len(elasticity_df)*100:.1f}%)")
+    print(f"Unit elastic (|ε| = 1): {len(unit_elastic)} units")
+    
+    # Top insights
+    print("\n3. KEY INSIGHTS")
+    print("-"*40)
+    
+    # Most elastic units
+    if len(elasticity_df) > 0:
+        most_elastic = elasticity_df.nsmallest(3, 'elasticity')
+        print("\nMost Price Sensitive Units (Elastic):")
+        for idx, row in most_elastic.iterrows():
+            print(f"  • {idx[:30]}: ε = {row['elasticity']:.3f}")
+            print(f"    Current rent: ${row['avg_rent']:.2f}, Occupancy: {row['avg_occupancy']*100:.1f}%")
+    
+    # Most inelastic units
+    if len(elasticity_df) > 0:
+        most_inelastic = elasticity_df[elasticity_df['elasticity'] < 0].nlargest(3, 'elasticity')
+        if not most_inelastic.empty:
+            print("\nLeast Price Sensitive Units (Inelastic):")
+            for idx, row in most_inelastic.iterrows():
+                print(f"  • {idx[:30]}: ε = {row['elasticity']:.3f}")
+                print(f"    Current rent: ${row['avg_rent']:.2f}, Occupancy: {row['avg_occupancy']*100:.1f}%")
+    
+    # Statistical significance
+    significant = elasticity_df[elasticity_df['p_value'] < 0.05]
+    print(f"\n4. STATISTICAL RELIABILITY")
+    print("-"*40)
+    print(f"Statistically significant results (p < 0.05): {len(significant)} units ({len(significant)/len(elasticity_df)*100:.1f}%)")
+    print(f"Average R² for significant results: {significant['r_squared'].mean():.3f}")
+    
+    # Detailed results table
+    print("\n5. DETAILED RESULTS TABLE")
+    print("-"*40)
+    
+    # Prepare display dataframe
+    display_df = elasticity_df.copy()
+    display_df['elasticity'] = display_df['elasticity'].round(3)
+    display_df['p_value'] = display_df['p_value'].round(4)
+    display_df['r_squared'] = display_df['r_squared'].round(3)
+    display_df['avg_rent'] = display_df['avg_rent'].round(0)
+    display_df['avg_occupancy'] = (display_df['avg_occupancy'] * 100).round(1)
+    
+    # Rename columns for display
+    display_df = display_df.rename(columns={
+        'elasticity': 'Elasticity',
+        'p_value': 'P-Value',
+        'r_squared': 'R²',
+        'observations': 'N',
+        'avg_rent': 'Avg Rent ($)',
+        'avg_occupancy': 'Avg Occ (%)'
+    })
+    
+    print(display_df[['Elasticity', 'P-Value', 'R²', 'N', 'Avg Rent ($)', 'Avg Occ (%)']].to_string())
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def run_elasticity_analysis(file_path='UnitStatistics_all.csv'):
+    """
+    Main function to run complete elasticity analysis
+    
+    Parameters:
+    -----------
+    file_path : str
+        Path to the CSV file
+    
+    Returns:
+    --------
+    tuple : (elasticity_results, elasticity_df, figure)
+    """
+    
+    print("\n" + "="*60)
+    print("🚀 STARTING PRICE ELASTICITY ANALYSIS")
+    print("="*60)
+    
+    # Step 1: Load and preprocess data
+    print("\n📁 Loading data...")
+    df = load_and_preprocess_data(file_path)
+    print(f"✓ Loaded {len(df)} records")
+    print(f"✓ Date range: {df['AsOfDate'].min().strftime('%Y-%m-%d')} to {df['AsOfDate'].max().strftime('%Y-%m-%d')}")
+    print(f"✓ Unit types: {df['Unit_Type'].nunique()}")
+    
+    # Step 2: Calculate elasticity
+    print("\n📈 Calculating price elasticity...")
+    elasticity_results, elasticity_df = calculate_price_elasticity(df)
+    
+    # Step 3: Create visualizations
+    print("\n📊 Creating visualizations...")
+    fig = create_elasticity_visualizations(elasticity_df, df)
+    
+    # Step 4: Print summary
+    print_elasticity_summary(elasticity_df)
+    
+    print("\n" + "="*60)
+    print("✅ ANALYSIS COMPLETE")
+    print("="*60)
+    
+    return elasticity_results, elasticity_df, fig
+
+# Execute the analysis
+if __name__ == "__main__":
+    # Run the analysis
+    results, summary_df, figure = run_elasticity_analysis('UnitStatistics_all.csv')
+    
+    # Optional: Save results to CSV
+    if not summary_df.empty:
+        summary_df.to_csv('elasticity_analysis_results.csv')
+        print("\n💾 Results saved to 'elasticity_analysis_results.csv'")
+    
+    print("\n🎯 Next Steps:")
+    print("  1. Review units with elastic demand for potential price reductions")
+    print("  2. Consider price increases for inelastic units with high occupancy")
+    print("  3. Monitor changes in elasticity over time")
+    print("  4. Test pricing strategies with A/B experiments")
